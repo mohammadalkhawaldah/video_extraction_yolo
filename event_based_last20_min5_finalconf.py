@@ -1,8 +1,14 @@
-import os
+import base64
 import glob
+import json
+import os
+import re
+import time
+from pathlib import Path
 import cv2
 from collections import defaultdict, deque
 from ultralytics import YOLO
+from openai import OpenAI
 
 # =====================================================
 # CONFIG
@@ -26,6 +32,36 @@ EXIT_MISSED_FRAMES = 10         # الخروج من المشهد
 
 SHOW = True
 
+# LLM (load level estimation)
+USE_LLM = True
+LLM_MODEL = "gpt-4o-mini"
+LLM_MAX_RETRIES = 2
+LLM_BBOX_PADDING = 0.08   # 8% padding around bbox
+LLM_TOP_EXTRA = 0.15      # extra padding upward (bed wall context)
+LLM_MULTI_CROPS = 3      # number of top bboxes to sample per track (set 1 for single)
+LLM_MAX_TOTAL_MS = 2000  # stop extra crops if total LLM time exceeds this (0 = no limit)
+
+SYSTEM_PROMPT = (
+    "You estimate dump-truck load fill level from a single image. "
+    "Load type may be cement bags, blocks, fine sand, bars, stones, or empty. "
+    "Focus on load level, not material type. "
+    "Use only visual inspection. Compare load height to truck bed wall height. "
+    "Assume a standard rectangular dump-truck container. "
+    "If edges or load surface are unclear, lower confidence. "
+    "Be conservative and realistic. "
+    "Return strict JSON only."
+)
+
+USER_PROMPT = (
+    "Estimate load fill level in the truck bed.\n"
+    "Return JSON with:\n"
+    "- fill_percent (integer 0-100)\n"
+    "- confidence (float 0.0-1.0)\n"
+    "- category (one of: empty, 25%, 50%, 75%, 90%, full)\n"
+    "- short_reasoning (<= 20 words)\n"
+    "Use only the image."
+)
+
 # =====================================================
 # Helpers
 # =====================================================
@@ -39,10 +75,116 @@ def sec_to_hhmmss_msec(seconds: float) -> str:
 def frame_to_time(frame_index: int, fps: float) -> float:
     return frame_index / fps if fps > 0 else 0.0
 
+
+def load_dotenv(dotenv_path: Path) -> None:
+    if not dotenv_path.is_file():
+        return
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"").strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def strict_json_from_text(text: str) -> dict:
+    text = text.strip()
+    if not text:
+        raise ValueError("Empty response")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("JSON is not an object")
+    return data
+
+
+def crop_with_padding(frame, bbox_xyxy, padding: float, top_extra: float):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_x = int(bw * padding)
+    pad_y = int(bh * padding)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y - int(bh * top_extra))
+    x2 = min(w - 1, x2 + pad_x)
+    y2 = min(h - 1, y2 + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2]
+
+
+def encode_image_b64(image) -> str:
+    ok, buf = cv2.imencode(".jpg", image)
+    if not ok:
+        raise ValueError("Failed to encode crop")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def estimate_fill_llm(client: OpenAI, image_b64: str) -> dict:
+    last_error = None
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            prompt_suffix = ""
+            if attempt > 0:
+                prompt_suffix = (
+                    "\nReturn ONLY the JSON object on a single line. "
+                    "Do not add any extra text."
+                )
+            response = client.responses.create(
+                model=LLM_MODEL,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": USER_PROMPT + prompt_suffix},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{image_b64}",
+                            },
+                        ],
+                    },
+                ],
+            )
+            return strict_json_from_text(response.output_text)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= LLM_MAX_RETRIES:
+                break
+    raise RuntimeError(f"LLM failed: {last_error}")
+
+
+def categorize_fill(percent: float) -> str:
+    if percent <= 5:
+        return "empty"
+    if percent <= 35:
+        return "25%"
+    if percent <= 60:
+        return "50%"
+    if percent <= 82:
+        return "75%"
+    if percent <= 95:
+        return "90%"
+    return "full"
+
 # =====================================================
 # MAIN
 # =====================================================
 def main():
+    load_dotenv(Path(".env"))
+    llm_client = OpenAI() if USE_LLM else None
     model = YOLO(MODEL_PATH)
     print("✅ Model loaded")
     print("🎯 Event-Based Classification (Last 20 + Min 5 + Final Conf)\n")
@@ -65,7 +207,13 @@ def main():
         track_data = defaultdict(lambda: {
             "history": deque(maxlen=WINDOW_SIZE),  # (class_id, conf)
             "last_seen": None,
-            "finalized": False
+            "finalized": False,
+            "last_bbox": None,
+            "last_frame": None,
+            "best_bbox": None,
+            "best_frame": None,
+            "best_area": 0,
+            "top_bboxes": [],  # list of (area, bbox, frame)
         })
 
         processed_frame_idx = 0
@@ -101,14 +249,39 @@ def main():
                 ids = r.boxes.id.int().tolist()
                 clss = r.boxes.cls.int().tolist()
                 confs = r.boxes.conf.tolist()
+                xyxys = r.boxes.xyxy.tolist()
 
-                for tid, cid, cf in zip(ids, clss, confs):
+                scale_x = frame.shape[1] / RESIZE_TO[0]
+                scale_y = frame.shape[0] / RESIZE_TO[1]
+
+                for tid, cid, cf, bbox in zip(ids, clss, confs, xyxys):
                     d = track_data[tid]
                     if d["finalized"]:
                         continue
 
                     d["history"].append((cid, float(cf)))
                     d["last_seen"] = processed_frame_idx
+                    d["last_frame"] = frame.copy()
+                    x1, y1, x2, y2 = bbox
+                    x1o = int(x1 * scale_x)
+                    y1o = int(y1 * scale_y)
+                    x2o = int(x2 * scale_x)
+                    y2o = int(y2 * scale_y)
+                    x1o = max(0, min(frame.shape[1] - 1, x1o))
+                    x2o = max(0, min(frame.shape[1] - 1, x2o))
+                    y1o = max(0, min(frame.shape[0] - 1, y1o))
+                    y2o = max(0, min(frame.shape[0] - 1, y2o))
+                    d["last_bbox"] = (x1o, y1o, x2o, y2o)
+                    area = max(0, x2o - x1o) * max(0, y2o - y1o)
+                    if area > d["best_area"]:
+                        d["best_area"] = area
+                        d["best_bbox"] = d["last_bbox"]
+                        d["best_frame"] = d["last_frame"]
+                    if area > 0:
+                        d["top_bboxes"].append((area, d["last_bbox"], d["last_frame"]))
+                        d["top_bboxes"] = sorted(
+                            d["top_bboxes"], key=lambda x: x[0], reverse=True
+                        )[: max(LLM_MULTI_CROPS, 1)]
 
             # تحقق من الخروج من المشهد
             for tid, d in list(track_data.items()):
@@ -145,11 +318,65 @@ def main():
                             )
                             event_time_str = sec_to_hhmmss_msec(event_time_sec)
 
-                            print(
-                                f"EVENT {event_time_str} | "
-                                f"track_id={tid} | "
-                                f"class={names[int(best_class_id)]}"
-                            )
+                            llm_payload = None
+                            llm_ms = None
+                            if USE_LLM and d["last_bbox"] is not None and llm_client:
+                                crops = []
+                                if d["top_bboxes"]:
+                                    crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
+                                else:
+                                    crops = [(d["best_area"], d["last_bbox"], d["last_frame"])]
+
+                                results = []
+                                total_ms = 0.0
+                                for _, bbox, source_frame in crops:
+                                    crop = crop_with_padding(
+                                        source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA
+                                    )
+                                    if crop is None:
+                                        continue
+                                    try:
+                                        start = time.perf_counter()
+                                        image_b64 = encode_image_b64(crop)
+                                        payload = estimate_fill_llm(llm_client, image_b64)
+                                        elapsed_ms = (time.perf_counter() - start) * 1000
+                                        total_ms += elapsed_ms
+                                        results.append(payload)
+                                    except Exception as exc:
+                                        print(f"[WARN] LLM error for track {tid}: {exc}")
+                                    if LLM_MAX_TOTAL_MS > 0 and total_ms >= LLM_MAX_TOTAL_MS:
+                                        break
+
+                                if results:
+                                    fills = [float(r.get("fill_percent", 0)) for r in results]
+                                    confs = [float(r.get("confidence", 0)) for r in results]
+                                    avg_fill = round(sum(fills) / len(fills))
+                                    avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
+                                    best_reason = max(
+                                        results, key=lambda r: float(r.get("confidence", 0))
+                                    ).get("short_reasoning", "")
+                                    llm_payload = {
+                                        "fill_percent": int(avg_fill),
+                                        "confidence": avg_conf,
+                                        "category": categorize_fill(avg_fill),
+                                        "short_reasoning": best_reason,
+                                    }
+                                    llm_ms = total_ms
+
+                            if llm_payload:
+                                print(
+                                    f"EVENT {event_time_str} | "
+                                    f"track_id={tid} | "
+                                    f"class={names[int(best_class_id)]} | "
+                                    f"load={llm_payload} | "
+                                    f"llm_ms={llm_ms:.0f}"
+                                )
+                            else:
+                                print(
+                                    f"EVENT {event_time_str} | "
+                                    f"track_id={tid} | "
+                                    f"class={names[int(best_class_id)]}"
+                                )
 
                     d["finalized"] = True
 
@@ -193,11 +420,65 @@ def main():
                     )
                     event_time_str = sec_to_hhmmss_msec(event_time_sec)
 
-                    print(
-                        f"EVENT {event_time_str} | "
-                        f"track_id={tid} | "
-                        f"class={names[int(best_class_id)]}"
-                    )
+                    llm_payload = None
+                    llm_ms = None
+                    if USE_LLM and d["last_bbox"] is not None and llm_client:
+                        crops = []
+                        if d["top_bboxes"]:
+                            crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
+                        else:
+                            crops = [(d["best_area"], d["last_bbox"], d["last_frame"])]
+
+                        results = []
+                        total_ms = 0.0
+                        for _, bbox, source_frame in crops:
+                            crop = crop_with_padding(
+                                source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA
+                            )
+                            if crop is None:
+                                continue
+                            try:
+                                start = time.perf_counter()
+                                image_b64 = encode_image_b64(crop)
+                                payload = estimate_fill_llm(llm_client, image_b64)
+                                elapsed_ms = (time.perf_counter() - start) * 1000
+                                total_ms += elapsed_ms
+                                results.append(payload)
+                            except Exception as exc:
+                                print(f"[WARN] LLM error for track {tid}: {exc}")
+                            if LLM_MAX_TOTAL_MS > 0 and total_ms >= LLM_MAX_TOTAL_MS:
+                                break
+
+                        if results:
+                            fills = [float(r.get("fill_percent", 0)) for r in results]
+                            confs = [float(r.get("confidence", 0)) for r in results]
+                            avg_fill = round(sum(fills) / len(fills))
+                            avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
+                            best_reason = max(
+                                results, key=lambda r: float(r.get("confidence", 0))
+                            ).get("short_reasoning", "")
+                            llm_payload = {
+                                "fill_percent": int(avg_fill),
+                                "confidence": avg_conf,
+                                "category": categorize_fill(avg_fill),
+                                "short_reasoning": best_reason,
+                            }
+                            llm_ms = total_ms
+
+                    if llm_payload:
+                        print(
+                            f"EVENT {event_time_str} | "
+                            f"track_id={tid} | "
+                            f"class={names[int(best_class_id)]} | "
+                            f"load={llm_payload} | "
+                            f"llm_ms={llm_ms:.0f}"
+                        )
+                    else:
+                        print(
+                            f"EVENT {event_time_str} | "
+                            f"track_id={tid} | "
+                            f"class={names[int(best_class_id)]}"
+                        )
 
         cap.release()
 
