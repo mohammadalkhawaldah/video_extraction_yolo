@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+output/
+outputs/
+slicing_result/
+test_videos/
+videos_to_slice/
+truck_images/
+*.pt
