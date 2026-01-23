@@ -1,3 +1,11 @@
+# =====================================================
+# event_based_latest20_finalconf_2.py
+# - Same logic as your current script (LLM + event gating unchanged)
+# - Fix: load_class is computed by associating NON-truck detections to the Truck track
+#        using Criterion A: (load bbox center inside truck bbox) IN THE SAME FRAME.
+# - No second YOLO run.
+# =====================================================
+
 import base64
 import glob
 import json
@@ -26,7 +34,7 @@ PROCESS_EVERY_N_FRAMES = 2
 
 # Event logic
 WINDOW_SIZE = 20                # آخر 20 فريم فقط
-MIN_FRAMES_PER_CLASS = 5        # تجاهل أي كلاس < 5 فريمات
+MIN_FRAMES_PER_CLASS = 5        # تجاهل أي كلاس < 5 فريمات (للـ Truck gating كما هو)
 FINAL_CONF_THRESHOLD = 0.55     # ⭐ Final Average Confidence Threshold
 EXIT_MISSED_FRAMES = 10         # الخروج من المشهد
 
@@ -49,6 +57,7 @@ LLM_MAX_TOTAL_MS = 2000  # stop extra crops if total LLM time exceeds this (0 = 
 
 # Debug
 DEBUG_CLASS_SCORES = True
+DEBUG_ASSOCIATION = True  # prints load_top derived from association (set False to reduce console spam)
 
 SYSTEM_PROMPT = (
     "You estimate dump-truck load fill level from a single image. "
@@ -84,7 +93,6 @@ def sec_to_hhmmss_msec(seconds: float) -> str:
 def frame_to_time(frame_index: int, fps: float) -> float:
     return frame_index / fps if fps > 0 else 0.0
 
-
 def load_dotenv(dotenv_path: Path) -> None:
     if not dotenv_path.is_file():
         return
@@ -97,7 +105,6 @@ def load_dotenv(dotenv_path: Path) -> None:
         value = value.strip().strip("\"").strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
-
 
 def strict_json_from_text(text: str) -> dict:
     text = text.strip()
@@ -114,7 +121,6 @@ def strict_json_from_text(text: str) -> dict:
         raise ValueError("JSON is not an object")
     return data
 
-
 def crop_with_padding(frame, bbox_xyxy, padding: float, top_extra: float):
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox_xyxy
@@ -130,7 +136,6 @@ def crop_with_padding(frame, bbox_xyxy, padding: float, top_extra: float):
         return None
     return frame[y1:y2, x1:x2]
 
-
 def encode_image_b64(image) -> str:
     h, w = image.shape[:2]
     if min(h, w) < LLM_MIN_CROP_SIZE:
@@ -141,7 +146,6 @@ def encode_image_b64(image) -> str:
     if not ok:
         raise ValueError("Failed to encode crop")
     return base64.b64encode(buf.tobytes()).decode("ascii")
-
 
 def estimate_fill_llm(client: OpenAI, image_b64: str) -> dict:
     last_error = None
@@ -173,12 +177,11 @@ def estimate_fill_llm(client: OpenAI, image_b64: str) -> dict:
                 ],
             )
             return strict_json_from_text(response.output_text)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = exc
             if attempt >= LLM_MAX_RETRIES:
                 break
     raise RuntimeError(f"LLM failed: {last_error}")
-
 
 def categorize_fill(percent: float) -> str:
     if percent <= 5:
@@ -193,24 +196,18 @@ def categorize_fill(percent: float) -> str:
         return "90%"
     return "full"
 
-
 def is_target_class(class_id: int, names: dict) -> bool:
     if TARGET_CLASS_ID is not None:
         return int(class_id) == int(TARGET_CLASS_ID)
     name = names.get(int(class_id), "").lower()
     return TARGET_CLASS_NAME.lower() in name
 
-
 def get_load_class(scores: dict, counts: dict, names: dict) -> str:
-    load_candidates = [
-        cid for cid in scores
-        if not is_target_class(cid, names)
-    ]
+    load_candidates = [cid for cid in scores if not is_target_class(cid, names)]
     if not load_candidates:
         return "unknown"
     best_id = max(load_candidates, key=lambda c: (scores[c], counts[c]))
     return names.get(int(best_id), "unknown")
-
 
 def top_classes(scores: dict, counts: dict, names: dict, top_n: int = 2):
     items = []
@@ -225,12 +222,21 @@ def top_classes(scores: dict, counts: dict, names: dict, top_n: int = 2):
     items.sort(key=lambda x: (x[2], x[1]), reverse=True)
     return items[:top_n]
 
+def center_of_bbox(b):
+    x1, y1, x2, y2 = b
+    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+
+def point_in_bbox(px, py, b):
+    x1, y1, x2, y2 = b
+    return (px >= x1) and (px <= x2) and (py >= y1) and (py <= y2)
+
 # =====================================================
 # MAIN
 # =====================================================
 def main():
     load_dotenv(Path(".env"))
     llm_client = OpenAI() if USE_LLM else None
+
     model = YOLO(MODEL_PATH)
     print("✅ Model loaded")
     print(f"Classes: {model.names}")
@@ -252,7 +258,8 @@ def main():
 
         # Track data لكل ID
         track_data = defaultdict(lambda: {
-            "history": deque(maxlen=WINDOW_SIZE),  # (class_id, conf)
+            "history": deque(maxlen=WINDOW_SIZE),       # (class_id, conf) for the track itself
+            "load_history": deque(maxlen=WINDOW_SIZE),  # (class_id, conf) associated to TRUCK tid ✅
             "last_seen": None,
             "finalized": False,
             "last_bbox": None,
@@ -291,7 +298,7 @@ def main():
             r = results[0]
             names = r.names
 
-            # تحديث آخر 20 فريم
+            # Update histories + collect detections for SAME-FRAME association
             if r.boxes is not None and r.boxes.id is not None:
                 ids = r.boxes.id.int().tolist()
                 clss = r.boxes.cls.int().tolist()
@@ -301,14 +308,23 @@ def main():
                 scale_x = frame.shape[1] / RESIZE_TO[0]
                 scale_y = frame.shape[0] / RESIZE_TO[1]
 
+                frame_dets = []  # (tid, cid, conf, bbox_o)
+
                 for tid, cid, cf, bbox in zip(ids, clss, confs, xyxys):
+                    tid = int(tid)
+                    cid = int(cid)
+                    cf = float(cf)
+
                     d = track_data[tid]
                     if d["finalized"]:
                         continue
 
-                    d["history"].append((cid, float(cf)))
+                    # per-track history (unchanged)
+                    d["history"].append((cid, cf))
                     d["last_seen"] = processed_frame_idx
-                    d["last_frame"] = frame.copy()
+                    d["last_frame"] = frame  # reference is fine
+
+                    # scale bbox to original frame
                     x1, y1, x2, y2 = bbox
                     x1o = int(x1 * scale_x)
                     y1o = int(y1 * scale_y)
@@ -318,17 +334,49 @@ def main():
                     x2o = max(0, min(frame.shape[1] - 1, x2o))
                     y1o = max(0, min(frame.shape[0] - 1, y1o))
                     y2o = max(0, min(frame.shape[0] - 1, y2o))
-                    d["last_bbox"] = (x1o, y1o, x2o, y2o)
+                    bbox_o = (x1o, y1o, x2o, y2o)
+                    d["last_bbox"] = bbox_o
+
+                    # keep best/top crops for LLM (unchanged)
                     area = max(0, x2o - x1o) * max(0, y2o - y1o)
                     if area > d["best_area"]:
                         d["best_area"] = area
-                        d["best_bbox"] = d["last_bbox"]
-                        d["best_frame"] = d["last_frame"]
+                        d["best_bbox"] = bbox_o
+                        d["best_frame"] = frame.copy()
                     if area > 0:
-                        d["top_bboxes"].append((area, d["last_bbox"], d["last_frame"]))
+                        d["top_bboxes"].append((area, bbox_o, frame.copy()))
                         d["top_bboxes"] = sorted(
                             d["top_bboxes"], key=lambda x: x[0], reverse=True
                         )[: max(LLM_MULTI_CROPS, 1)]
+
+                    frame_dets.append((tid, cid, cf, bbox_o))
+
+                # -----------------------------------------------------
+                # SAME-FRAME Association (Criterion A):
+                # link non-truck detections to the truck bbox (by center inside truck bbox)
+                # and store them in truck track_data[truck_tid]["load_history"]
+                # -----------------------------------------------------
+                truck_boxes = {}     # truck_tid -> bbox_o
+                nontruck_dets = []   # (cid, conf, bbox_o)
+
+                for tid_i, cid_i, cf_i, bbox_i in frame_dets:
+                    if is_target_class(cid_i, names):
+                        truck_boxes[tid_i] = bbox_i
+                    else:
+                        nontruck_dets.append((cid_i, cf_i, bbox_i))
+
+                if truck_boxes and nontruck_dets:
+                    for cid_i, cf_i, bbox_i in nontruck_dets:
+                        cx, cy = center_of_bbox(bbox_i)
+
+                        linked_tid = None
+                        for ttid, tb in truck_boxes.items():
+                            if point_in_bbox(cx, cy, tb):
+                                linked_tid = ttid
+                                break
+
+                        if linked_tid is not None:
+                            track_data[linked_tid]["load_history"].append((cid_i, cf_i))
 
             # تحقق من الخروج من المشهد
             for tid, d in list(track_data.items()):
@@ -339,12 +387,12 @@ def main():
                     scores = defaultdict(float)
                     counts = defaultdict(int)
 
-                    # تجميع آخر 20 فريم
+                    # تجميع آخر 20 فريم (truck track history)
                     for cid, cf in d["history"]:
                         scores[cid] += cf
                         counts[cid] += 1
 
-                    # تجاهل الكلاسات غير المستقرة
+                    # Truck gating unchanged
                     valid_classes = [
                         cid for cid in scores
                         if counts[cid] >= MIN_FRAMES_PER_CLASS
@@ -352,40 +400,49 @@ def main():
                     ]
 
                     if valid_classes:
-                        best_class_id = max(
-                            valid_classes,
-                            key=lambda c: (scores[c], counts[c])
-                        )
-
+                        best_class_id = max(valid_classes, key=lambda c: (scores[c], counts[c]))
                         avg_conf = scores[best_class_id] / counts[best_class_id]
-                        load_class = get_load_class(scores, counts, names)
+
+                        # NEW: load class from associated load_history (same-frame association)
+                        load_scores = defaultdict(float)
+                        load_counts = defaultdict(int)
+                        for cid_l, cf_l in d["load_history"]:
+                            load_scores[cid_l] += cf_l
+                            load_counts[cid_l] += 1
+
+                        load_class = get_load_class(load_scores, load_counts, names)
+
                         debug_info = ""
+                        assoc_info = ""
                         if DEBUG_CLASS_SCORES:
                             top2 = top_classes(scores, counts, names, top_n=2)
                             debug_info = f" | top={top2}"
+                        if DEBUG_ASSOCIATION:
+                            load_top = top_classes(load_scores, load_counts, names, top_n=3) if load_scores else []
+                            assoc_info = f" | load_top={load_top}"
 
-                        # ⭐ Final confidence threshold
+                        # ⭐ Final confidence threshold (unchanged)
                         if avg_conf >= FINAL_CONF_THRESHOLD:
-                            event_time_sec = frame_to_time(
-                                d["last_seen"] * PROCESS_EVERY_N_FRAMES, fps
-                            )
+                            event_time_sec = frame_to_time(d["last_seen"] * PROCESS_EVERY_N_FRAMES, fps)
                             event_time_str = sec_to_hhmmss_msec(event_time_sec)
 
                             llm_payload = None
                             llm_ms = None
+
+                            # LLM logic (unchanged)
                             if USE_LLM and d["last_bbox"] is not None and llm_client:
                                 crops = []
                                 if d["top_bboxes"]:
                                     crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
                                 else:
-                                    crops = [(d["best_area"], d["last_bbox"], d["last_frame"])]
+                                    crops = [(d["best_area"], d["best_bbox"], d["best_frame"])]
 
-                                results = []
+                                results_llm = []
                                 total_ms = 0.0
                                 for _, bbox, source_frame in crops:
-                                    crop = crop_with_padding(
-                                        source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA
-                                    )
+                                    if source_frame is None or bbox is None:
+                                        continue
+                                    crop = crop_with_padding(source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA)
                                     if crop is None:
                                         continue
                                     try:
@@ -394,23 +451,21 @@ def main():
                                         payload = estimate_fill_llm(llm_client, image_b64)
                                         elapsed_ms = (time.perf_counter() - start) * 1000
                                         total_ms += elapsed_ms
-                                        results.append(payload)
+                                        results_llm.append(payload)
                                     except Exception as exc:
                                         print(f"[WARN] LLM error for track {tid}: {exc}")
                                     if LLM_MAX_TOTAL_MS > 0 and total_ms >= LLM_MAX_TOTAL_MS:
                                         break
 
-                                if results:
-                                    fills = [float(r.get("fill_percent", 0)) for r in results]
-                                    confs = [float(r.get("confidence", 0)) for r in results]
+                                if results_llm:
+                                    fills = [float(rr.get("fill_percent", 0)) for rr in results_llm]
+                                    confs_llm = [float(rr.get("confidence", 0)) for rr in results_llm]
                                     avg_fill = round(sum(fills) / len(fills))
-                                    avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
-                                    best_reason = max(
-                                        results, key=lambda r: float(r.get("confidence", 0))
-                                    ).get("short_reasoning", "")
+                                    avg_conf_llm = round(sum(confs_llm) / len(confs_llm), 3) if confs_llm else 0.0
+                                    best_reason = max(results_llm, key=lambda rr: float(rr.get("confidence", 0))).get("short_reasoning", "")
                                     llm_payload = {
                                         "fill_percent": int(avg_fill),
-                                        "confidence": avg_conf,
+                                        "confidence": avg_conf_llm,
                                         "category": categorize_fill(avg_fill),
                                         "short_reasoning": best_reason,
                                     }
@@ -424,7 +479,7 @@ def main():
                                     f"load_class={load_class} | "
                                     f"load={llm_payload} | "
                                     f"llm_ms={llm_ms:.0f}"
-                                    f"{debug_info}"
+                                    f"{debug_info}{assoc_info}"
                                 )
                             else:
                                 print(
@@ -432,7 +487,7 @@ def main():
                                     f"track_id={tid} | "
                                     f"class={names[int(best_class_id)]} | "
                                     f"load_class={load_class}"
-                                    f"{debug_info}"
+                                    f"{debug_info}{assoc_info}"
                                 )
 
                     d["finalized"] = True
@@ -453,7 +508,6 @@ def main():
 
             scores = defaultdict(float)
             counts = defaultdict(int)
-
             for cid, cf in d["history"]:
                 scores[cid] += cf
                 counts[cid] += 1
@@ -465,22 +519,28 @@ def main():
             ]
 
             if valid_classes:
-                best_class_id = max(
-                    valid_classes,
-                    key=lambda c: (scores[c], counts[c])
-                )
-
+                best_class_id = max(valid_classes, key=lambda c: (scores[c], counts[c]))
                 avg_conf = scores[best_class_id] / counts[best_class_id]
-                load_class = get_load_class(scores, counts, names)
+
+                # NEW: load class from associated load_history
+                load_scores = defaultdict(float)
+                load_counts = defaultdict(int)
+                for cid_l, cf_l in d["load_history"]:
+                    load_scores[cid_l] += cf_l
+                    load_counts[cid_l] += 1
+                load_class = get_load_class(load_scores, load_counts, names)
+
                 debug_info = ""
+                assoc_info = ""
                 if DEBUG_CLASS_SCORES:
                     top2 = top_classes(scores, counts, names, top_n=2)
                     debug_info = f" | top={top2}"
+                if DEBUG_ASSOCIATION:
+                    load_top = top_classes(load_scores, load_counts, names, top_n=3) if load_scores else []
+                    assoc_info = f" | load_top={load_top}"
 
                 if avg_conf >= FINAL_CONF_THRESHOLD:
-                    event_time_sec = frame_to_time(
-                        d["last_seen"] * PROCESS_EVERY_N_FRAMES, fps
-                    )
+                    event_time_sec = frame_to_time(d["last_seen"] * PROCESS_EVERY_N_FRAMES, fps)
                     event_time_str = sec_to_hhmmss_msec(event_time_sec)
 
                     llm_payload = None
@@ -490,14 +550,14 @@ def main():
                         if d["top_bboxes"]:
                             crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
                         else:
-                            crops = [(d["best_area"], d["last_bbox"], d["last_frame"])]
+                            crops = [(d["best_area"], d["best_bbox"], d["best_frame"])]
 
-                        results = []
+                        results_llm = []
                         total_ms = 0.0
                         for _, bbox, source_frame in crops:
-                            crop = crop_with_padding(
-                                source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA
-                            )
+                            if source_frame is None or bbox is None:
+                                continue
+                            crop = crop_with_padding(source_frame, bbox, LLM_BBOX_PADDING, LLM_TOP_EXTRA)
                             if crop is None:
                                 continue
                             try:
@@ -506,23 +566,21 @@ def main():
                                 payload = estimate_fill_llm(llm_client, image_b64)
                                 elapsed_ms = (time.perf_counter() - start) * 1000
                                 total_ms += elapsed_ms
-                                results.append(payload)
+                                results_llm.append(payload)
                             except Exception as exc:
                                 print(f"[WARN] LLM error for track {tid}: {exc}")
                             if LLM_MAX_TOTAL_MS > 0 and total_ms >= LLM_MAX_TOTAL_MS:
                                 break
 
-                        if results:
-                            fills = [float(r.get("fill_percent", 0)) for r in results]
-                            confs = [float(r.get("confidence", 0)) for r in results]
+                        if results_llm:
+                            fills = [float(rr.get("fill_percent", 0)) for rr in results_llm]
+                            confs_llm = [float(rr.get("confidence", 0)) for rr in results_llm]
                             avg_fill = round(sum(fills) / len(fills))
-                            avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
-                            best_reason = max(
-                                results, key=lambda r: float(r.get("confidence", 0))
-                            ).get("short_reasoning", "")
+                            avg_conf_llm = round(sum(confs_llm) / len(confs_llm), 3) if confs_llm else 0.0
+                            best_reason = max(results_llm, key=lambda rr: float(rr.get("confidence", 0))).get("short_reasoning", "")
                             llm_payload = {
                                 "fill_percent": int(avg_fill),
-                                "confidence": avg_conf,
+                                "confidence": avg_conf_llm,
                                 "category": categorize_fill(avg_fill),
                                 "short_reasoning": best_reason,
                             }
@@ -536,7 +594,7 @@ def main():
                             f"load_class={load_class} | "
                             f"load={llm_payload} | "
                             f"llm_ms={llm_ms:.0f}"
-                            f"{debug_info}"
+                            f"{debug_info}{assoc_info}"
                         )
                     else:
                         print(
@@ -544,7 +602,7 @@ def main():
                             f"track_id={tid} | "
                             f"class={names[int(best_class_id)]} | "
                             f"load_class={load_class}"
-                            f"{debug_info}"
+                            f"{debug_info}{assoc_info}"
                         )
 
         cap.release()
