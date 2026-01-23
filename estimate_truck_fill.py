@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="gpt-4o-mini",
+        default="gpt-5.2-chat-latest",
         help="OpenAI vision model (Responses API compatible).",
     )
     parser.add_argument(

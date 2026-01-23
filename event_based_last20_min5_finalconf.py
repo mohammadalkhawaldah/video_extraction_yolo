@@ -32,12 +32,18 @@ EXIT_MISSED_FRAMES = 10         # الخروج من المشهد
 
 SHOW = True
 
+# Target class
+TARGET_CLASS_NAME = "Truck"  # update if your model uses a different label
+TARGET_CLASS_ID = None       # set to an int to match by class id instead
+
 # LLM (load level estimation)
 USE_LLM = True
-LLM_MODEL = "gpt-4o-mini"
+LLM_MODEL = "gpt-5.2-chat-latest"
 LLM_MAX_RETRIES = 2
 LLM_BBOX_PADDING = 0.08   # 8% padding around bbox
 LLM_TOP_EXTRA = 0.15      # extra padding upward (bed wall context)
+LLM_MIN_CROP_SIZE = 480   # min edge length before upscaling
+LLM_UPSCALE = 1.5         # upscale factor for small crops
 LLM_MULTI_CROPS = 3      # number of top bboxes to sample per track (set 1 for single)
 LLM_MAX_TOTAL_MS = 2000  # stop extra crops if total LLM time exceeds this (0 = no limit)
 
@@ -57,7 +63,7 @@ USER_PROMPT = (
     "Return JSON with:\n"
     "- fill_percent (integer 0-100)\n"
     "- confidence (float 0.0-1.0)\n"
-    "- category (one of: empty, 25%, 50%, 75%, 90%, full)\n"
+    "- category (one of: 0%, 25%, 50%, 75%, 90%, 100%)\n"
     "- short_reasoning (<= 20 words)\n"
     "Use only the image."
 )
@@ -123,6 +129,11 @@ def crop_with_padding(frame, bbox_xyxy, padding: float, top_extra: float):
 
 
 def encode_image_b64(image) -> str:
+    h, w = image.shape[:2]
+    if min(h, w) < LLM_MIN_CROP_SIZE:
+        new_w = int(w * LLM_UPSCALE)
+        new_h = int(h * LLM_UPSCALE)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
     ok, buf = cv2.imencode(".jpg", image)
     if not ok:
         raise ValueError("Failed to encode crop")
@@ -179,6 +190,24 @@ def categorize_fill(percent: float) -> str:
         return "90%"
     return "full"
 
+
+def is_target_class(class_id: int, names: dict) -> bool:
+    if TARGET_CLASS_ID is not None:
+        return int(class_id) == int(TARGET_CLASS_ID)
+    name = names.get(int(class_id), "").lower()
+    return TARGET_CLASS_NAME.lower() in name
+
+
+def get_load_class(scores: dict, counts: dict, names: dict) -> str:
+    load_candidates = [
+        cid for cid in scores
+        if counts[cid] >= MIN_FRAMES_PER_CLASS and not is_target_class(cid, names)
+    ]
+    if not load_candidates:
+        return "unknown"
+    best_id = max(load_candidates, key=lambda c: (scores[c], counts[c]))
+    return names.get(int(best_id), "unknown")
+
 # =====================================================
 # MAIN
 # =====================================================
@@ -187,6 +216,7 @@ def main():
     llm_client = OpenAI() if USE_LLM else None
     model = YOLO(MODEL_PATH)
     print("✅ Model loaded")
+    print(f"Classes: {model.names}")
     print("🎯 Event-Based Classification (Last 20 + Min 5 + Final Conf)\n")
 
     video_files = glob.glob(os.path.join(VIDEO_FOLDER, "*.mp4"))
@@ -301,6 +331,7 @@ def main():
                     valid_classes = [
                         cid for cid in scores
                         if counts[cid] >= MIN_FRAMES_PER_CLASS
+                        and is_target_class(cid, names)
                     ]
 
                     if valid_classes:
@@ -310,6 +341,7 @@ def main():
                         )
 
                         avg_conf = scores[best_class_id] / counts[best_class_id]
+                        load_class = get_load_class(scores, counts, names)
 
                         # ⭐ Final confidence threshold
                         if avg_conf >= FINAL_CONF_THRESHOLD:
@@ -368,6 +400,7 @@ def main():
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
                                     f"class={names[int(best_class_id)]} | "
+                                    f"load_class={load_class} | "
                                     f"load={llm_payload} | "
                                     f"llm_ms={llm_ms:.0f}"
                                 )
@@ -375,7 +408,8 @@ def main():
                                 print(
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
-                                    f"class={names[int(best_class_id)]}"
+                                    f"class={names[int(best_class_id)]} | "
+                                    f"load_class={load_class}"
                                 )
 
                     d["finalized"] = True
@@ -404,6 +438,7 @@ def main():
             valid_classes = [
                 cid for cid in scores
                 if counts[cid] >= MIN_FRAMES_PER_CLASS
+                and is_target_class(cid, names)
             ]
 
             if valid_classes:
@@ -413,6 +448,7 @@ def main():
                 )
 
                 avg_conf = scores[best_class_id] / counts[best_class_id]
+                load_class = get_load_class(scores, counts, names)
 
                 if avg_conf >= FINAL_CONF_THRESHOLD:
                     event_time_sec = frame_to_time(
@@ -470,6 +506,7 @@ def main():
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
                             f"class={names[int(best_class_id)]} | "
+                            f"load_class={load_class} | "
                             f"load={llm_payload} | "
                             f"llm_ms={llm_ms:.0f}"
                         )
@@ -477,7 +514,8 @@ def main():
                         print(
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
-                            f"class={names[int(best_class_id)]}"
+                            f"class={names[int(best_class_id)]} | "
+                            f"load_class={load_class}"
                         )
 
         cap.release()
