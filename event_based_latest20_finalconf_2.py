@@ -6,6 +6,7 @@
 # - No second YOLO run.
 # =====================================================
 
+import argparse
 import base64
 import glob
 import json
@@ -21,8 +22,9 @@ from openai import OpenAI
 # =====================================================
 # CONFIG
 # =====================================================
-MODEL_PATH = r"C:\Users\moham\OneDrive\Documents\clips_extraction_by_yolo\best.pt"
+MODEL_PATH = r"C:\Users\moham\Downloads\best.pt"
 VIDEO_FOLDER = r"C:\Users\moham\OneDrive\Documents\clips_extraction_by_yolo\test_videos"
+VIDEO_PATH = r"C:\Users\moham\Downloads\WhatsApp Video 2026-01-28 at 9.04.28 PM.mp4"
 
 CONFIDENCE = 0.35
 IOU = 0.5
@@ -147,7 +149,7 @@ def encode_image_b64(image) -> str:
         raise ValueError("Failed to encode crop")
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
-def estimate_fill_llm(client: OpenAI, image_b64: str) -> dict:
+def estimate_fill_llm(client: OpenAI, image_b64: str, model_name: str) -> dict:
     last_error = None
     for attempt in range(LLM_MAX_RETRIES + 1):
         try:
@@ -158,7 +160,7 @@ def estimate_fill_llm(client: OpenAI, image_b64: str) -> dict:
                     "Do not add any extra text."
                 )
             response = client.responses.create(
-                model=LLM_MODEL,
+                model=model_name,
                 input=[
                     {
                         "role": "system",
@@ -234,19 +236,42 @@ def point_in_bbox(px, py, b):
 # MAIN
 # =====================================================
 def main():
+    parser = argparse.ArgumentParser(
+        description="Event-based truck detection with optional LLM load estimation."
+    )
+    parser.add_argument("--model", default=LLM_MODEL, help="LLM model name.")
+    parser.add_argument(
+        "--llm",
+        default="true",
+        help="Enable LLM load estimation (true/false).",
+    )
+    parser.add_argument(
+        "--show",
+        default="true",
+        help="Show annotated video window (true/false).",
+    )
+    args = parser.parse_args()
+
+    def to_bool(value: str) -> bool:
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+
+    use_llm = to_bool(args.llm)
+    show = to_bool(args.show)
+    llm_model = args.model
+
     load_dotenv(Path(".env"))
-    llm_client = OpenAI() if USE_LLM else None
+    llm_client = OpenAI() if use_llm else None
 
     model = YOLO(MODEL_PATH)
     print("✅ Model loaded")
     print(f"Classes: {model.names}")
     print("🎯 Event-Based Classification (Last 20 + Min 5 + Final Conf)\n")
 
-    video_files = glob.glob(os.path.join(VIDEO_FOLDER, "*.mp4"))
+    video_files = [VIDEO_PATH] if VIDEO_PATH else glob.glob(os.path.join(VIDEO_FOLDER, "*.mp4"))
     if not video_files:
         raise FileNotFoundError("❌ No videos found")
 
-    if SHOW:
+    if show:
         cv2.namedWindow("YOLO Event-Based (Stable)", cv2.WINDOW_NORMAL)
 
     for video_path in video_files:
@@ -430,7 +455,7 @@ def main():
                             llm_ms = None
 
                             # LLM logic (unchanged)
-                            if USE_LLM and d["last_bbox"] is not None and llm_client:
+                            if use_llm and d["last_bbox"] is not None and llm_client:
                                 crops = []
                                 if d["top_bboxes"]:
                                     crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
@@ -448,7 +473,9 @@ def main():
                                     try:
                                         start = time.perf_counter()
                                         image_b64 = encode_image_b64(crop)
-                                        payload = estimate_fill_llm(llm_client, image_b64)
+                                        payload = estimate_fill_llm(
+                                            llm_client, image_b64, llm_model
+                                        )
                                         elapsed_ms = (time.perf_counter() - start) * 1000
                                         total_ms += elapsed_ms
                                         results_llm.append(payload)
@@ -472,6 +499,7 @@ def main():
                                     llm_ms = total_ms
 
                             if llm_payload:
+                                print()
                                 print(
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
@@ -479,21 +507,22 @@ def main():
                                     f"load_class={load_class} | "
                                     f"load={llm_payload} | "
                                     f"llm_ms={llm_ms:.0f}"
-                                    f"{debug_info}{assoc_info}"
+                                    f""
                                 )
                             else:
+                                print()
                                 print(
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
                                     f"class={names[int(best_class_id)]} | "
                                     f"load_class={load_class}"
-                                    f"{debug_info}{assoc_info}"
+                                    f""
                                 )
 
                     d["finalized"] = True
 
             # عرض الفيديو
-            if SHOW:
+            if show:
                 annotated = r.plot()
                 cv2.imshow("YOLO Event-Based (Stable)", annotated)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -545,7 +574,7 @@ def main():
 
                     llm_payload = None
                     llm_ms = None
-                    if USE_LLM and d["last_bbox"] is not None and llm_client:
+                    if use_llm and d["last_bbox"] is not None and llm_client:
                         crops = []
                         if d["top_bboxes"]:
                             crops = d["top_bboxes"][: max(LLM_MULTI_CROPS, 1)]
@@ -563,7 +592,9 @@ def main():
                             try:
                                 start = time.perf_counter()
                                 image_b64 = encode_image_b64(crop)
-                                payload = estimate_fill_llm(llm_client, image_b64)
+                                payload = estimate_fill_llm(
+                                    llm_client, image_b64, llm_model
+                                )
                                 elapsed_ms = (time.perf_counter() - start) * 1000
                                 total_ms += elapsed_ms
                                 results_llm.append(payload)
@@ -587,6 +618,7 @@ def main():
                             llm_ms = total_ms
 
                     if llm_payload:
+                        print()
                         print(
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
@@ -594,20 +626,21 @@ def main():
                             f"load_class={load_class} | "
                             f"load={llm_payload} | "
                             f"llm_ms={llm_ms:.0f}"
-                            f"{debug_info}{assoc_info}"
+                            f""
                         )
                     else:
+                        print()
                         print(
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
                             f"class={names[int(best_class_id)]} | "
                             f"load_class={load_class}"
-                            f"{debug_info}{assoc_info}"
+                            f""
                         )
 
         cap.release()
 
-    if SHOW:
+    if show:
         cv2.destroyAllWindows()
 
     print("\n✅ Processing completed")

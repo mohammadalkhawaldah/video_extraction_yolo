@@ -417,6 +417,7 @@ def main():
                                     llm_ms = total_ms
 
                             if llm_payload:
+                                print()
                                 print(
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
@@ -427,6 +428,7 @@ def main():
                                     f"{debug_info}"
                                 )
                             else:
+                                print()
                                 print(
                                     f"EVENT {event_time_str} | "
                                     f"track_id={tid} | "
@@ -529,6 +531,7 @@ def main():
                             llm_ms = total_ms
 
                     if llm_payload:
+                        print()
                         print(
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
@@ -539,6 +542,7 @@ def main():
                             f"{debug_info}"
                         )
                     else:
+                        print()
                         print(
                             f"EVENT {event_time_str} | "
                             f"track_id={tid} | "
